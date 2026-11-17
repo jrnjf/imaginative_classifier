@@ -30,34 +30,43 @@ def main():
     # ---------------------------------------------------------
     # 2. Model, Loss & Momentum-Free Optimizer Initialization
     # ---------------------------------------------------------
-    latent_dim = 100
+    latent_dim = 128  # Matched to your 100M diamond generator dimension
     total_epochs = 200
     period_epochs = 1.0
 
     generator = ConditionalGenerator(latent_dim=latent_dim, num_classes=100).to(device)
     classifier = DualHeadResNet18(num_classes=100).to(device)
-    criterion_uncertainty = UncertaintyWeightedLoss().to(device)
-
-    # Momentum-free optimizers (SGD with momentum=0.0)
-    optimizer_G = optim.AdamW(generator.parameters(), lr=0.0002, betas=(0.85, 0.999), weight_decay=1e-2)
-    optimizer_C = optim.AdamW([
-        {'params': classifier.parameters()},
-        {'params': criterion_uncertainty.parameters(), 'lr': 0.0002}
-    ], lr=0.0002, betas=(0.85, 0.999), weight_decay=1e-2)
+    criterion_uncertainty = UncertaintyWeightedLoss(use_dnn_meta=True).to(device)
+    
+    # Momentum-free optimizers (SGD / AdamW configurations)
+    if criterion_uncertainty.use_dnn_meta:
+        optimizer_C = optim.SGD([
+            {'params': classifier.parameters()},
+            {'params': criterion_uncertainty.meta_net.parameters(), 'lr': 0.0}
+        ], lr=1.0, momentum=0.0, weight_decay=1e-3)
+        optimizer_G = optim.SGD([
+            {'params': generator.parameters()},
+            {'params': criterion_uncertainty.meta_net.parameters(), 'lr': 0.0}
+        ], lr=1.0, momentum=0.0, weight_decay=1e-4)
+    else:
+        optimizer_C = optim.SGD([
+            {'params': classifier.parameters()},
+            {'params': [criterion_uncertainty.s1, criterion_uncertainty.s2], 'lr': 0.1}
+        ], lr=1.0, momentum=0.0, weight_decay=1e-3)
+        optimizer_G = optim.SGD([
+            {'params': generator.parameters()},
+            {'params': [criterion_uncertainty.s3, criterion_uncertainty.s4], 'lr': 0.1}
+        ], lr=1.0, momentum=0.0, weight_decay=1e-4)
 
     steps_per_epoch = len(trainloader)
     period_steps = period_epochs * steps_per_epoch
-
-    # ---------------------------------------------------------
-    # 3. Schedulers with 90-Degree Phase Shift
-    # ---------------------------------------------------------
-
-
+    scheduler_c = TriangularCosineLR(optimizer_C, period_steps=period_steps, total_steps=total_epochs*steps_per_epoch, lr_ratio=1000.0, cos_end_ratio=0.1)
+    scheduler_g = TriangularCosineLR(optimizer_G, period_steps=period_steps, total_steps=total_epochs*steps_per_epoch, lr_ratio=1000.0, cos_end_ratio=0.1) #, phase_steps=period_steps/2.0) 
+    
     ce_criterion = nn.CrossEntropyLoss()
-    bce_criterion = nn.BCELoss()
 
     # ---------------------------------------------------------
-    # 4. Training & Validation Loop
+    # 3. Training & Validation Loop
     # ---------------------------------------------------------
     print("\nStarting Training with Detailed Step Logging & Validation...")
     
@@ -70,50 +79,47 @@ def main():
             real_imgs = real_imgs.to(device)
             real_labels = real_labels.to(device)
 
-            # --- Step A: Train Dual-Head Classifier ---
-# --- Step A: Train Dual-Head Classifier ---
-            optimizer_C.zero_grad()
+            # --- Forward Passes ---
             class_logits_real, truth_logit_real = classifier(real_imgs)
 
             z = torch.randn(batch_size, latent_dim, 1, 1, device=device)
             fake_labels = torch.randint(0, 100, (batch_size,), device=device)
             fake_imgs = generator(z, fake_labels).detach()
-
             class_logits_fake, truth_logit_fake = classifier(fake_imgs)
 
-            loss_C, l_class, l_truth, s1, s2 = criterion_uncertainty(
+
+            # --- Compute Unified Uncertainty Losses (s1, s2, s3, s4) ---
+            loss_C, loss_G, metrics = criterion_uncertainty(
                 class_logits_real, real_labels, truth_logit_real,
-                class_logits_fake, truth_logit_fake
+                class_logits_fake, truth_logit_fake,
+                class_logits_fake, fake_labels, truth_logit_fake
             )
 
-            loss_C.backward()
-            optimizer_C.step()
-
-            # --- Step B: Train Conditional Generator (Decoupled Reward) ---
+            # --- Step A: Train Classifier (Conditional on truth loss >= 1.2) ---
+            optimizer_C.zero_grad()
             optimizer_G.zero_grad()
-            z = torch.randn(batch_size, latent_dim, 1, 1, device=device)
-            gen_imgs = generator(z, fake_labels)
-            class_logits_gen, truth_logit_gen = classifier(gen_imgs)
 
-            # 1. Classification Reward: Rewarded for hitting the correct target class 
-            # (even if the classifier's truth head catches it as fake)
-            loss_G_class = ce_criterion(class_logits_gen, fake_labels)
-
-            # 2. Hinge Deception Loss: Generator wants truth logit to look real (>= +1)
-            loss_G_truth = -torch.mean(truth_logit_gen)
-
-            # Total Generator Loss combining category learning and deception
-            loss_G = loss_G_class + 0.5 * loss_G_truth
+            loss_C.backward(retain_graph=True)  # Retain graph so loss_G can backprop through shared weights/meta_net
+            torch.nn.utils.clip_grad_norm_(classifier.parameters(), max_norm=1.0) # <--- Add this
+            # --- Step B: Train Conditional Generator ---
             loss_G.backward()
+            torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0) # <--- Add this
             optimizer_G.step()
+            scheduler_g.step()
+            optimizer_C.step()
+            scheduler_c.step()
+
+            
+
             # --- Per-Step Detailed Logging ---
-            if i % 100 == 0:
+            if i % 100 == 0 or True:
                 print(f"Epoch [{epoch+1}/{total_epochs}], Step [{i}/{steps_per_epoch}]: "
-                      f"Class Loss: {l_class:.4f} | Truth Loss: {l_truth:.4f} | "
-                      f"Gen Loss: {loss_G.item():.4f} | weights [s1: {s1:.2f}, s2: {s2:.2f}]")
+                      f"Class Loss: {metrics['l_class']:.4f} | Truth Loss: {metrics['l_truth']:.4f} | "
+                      f"Gen Class: {metrics['l_gen_class']:.4f} | Gen Truth: {metrics['l_gen_truth']:.4f} | "
+                      f"weights [s1: {metrics['s1']:.2f}, s2: {metrics['s2']:.2f}, s3: {metrics['s3']:.2f}, s4: {metrics['s4']:.2f}]")
 
         # ---------------------------------------------------------
-        # 5. Validation Evaluation on Real Dataset Split
+        # Validation Loop (Standard Cross-Entropy & Accuracy)
         # ---------------------------------------------------------
         classifier.eval()
         val_loss = 0.0
@@ -125,24 +131,19 @@ def main():
                 val_imgs = val_imgs.to(device)
                 val_labels = val_labels.to(device)
 
-                val_class_logits, val_truth_prob = classifier(val_imgs)
+                val_class_logits, _ = classifier(val_imgs)
+                loss = ce_criterion(val_class_logits, val_labels)
                 
-                ce_val = ce_criterion(val_class_logits, val_labels)
-                bce_val = bce_criterion(val_truth_prob, torch.ones_like(val_truth_prob))
-                batch_val_loss = ce_val + bce_val
-                
-                val_loss += batch_val_loss.item() * val_imgs.size(0)
-                
+                val_loss += loss.item() * val_imgs.size(0)
                 _, predicted = torch.max(val_class_logits.data, 1)
                 total += val_labels.size(0)
                 correct += (predicted == val_labels).sum().item()
 
-        epoch_val_loss = val_loss / len(testset)
+        epoch_val_loss = val_loss / total
         epoch_val_acc = 100.0 * correct / total
-
+        
         print(f"============================================================")
-        print(f"EPOCH [{epoch+1}/{total_epochs}] COMPLETE | "
-              f"Val Loss: {epoch_val_loss:.4f} | Val Acc: {epoch_val_acc:.2f}%")
+        print(f"EPOCH [{epoch+1}/{total_epochs}] COMPLETE | Val Loss: {epoch_val_loss:.4f} | Val Acc: {epoch_val_acc:.2f}%")
         print(f"============================================================")
 
     print("\nTraining and validation complete!")

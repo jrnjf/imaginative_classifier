@@ -4,37 +4,41 @@ import torchvision
 
 class ConditionalGenerator(nn.Module):
     """
-    Takes latent noise z and a class label y, embeds the class label,
-    and generates a 32x32 synthetic image conditioned on that class.
+    Symmetric Double-Cone (Diamond) Conditional Generator (~100.3M parameters).
+    Channel progression: 384 -> 1280 -> 2048 (peak) -> 1280 -> 512 -> 3
+    Spatial progression: 1x1 -> 4x4  -> 8x8         -> 16x16 -> 32x32 -> 32x32
     """
-    def __init__(self, latent_dim=100, num_classes=100, embed_dim=50):
+    def __init__(self, latent_dim=128, num_classes=100, embed_dim=256):
         super().__init__()
         self.label_emb = nn.Embedding(num_classes, embed_dim)
-        in_dim = latent_dim + embed_dim
+        in_dim = latent_dim + embed_dim  # 384 channels
         
         self.net = nn.Sequential(
-            # [B, in_dim, 1, 1] -> [B, 512, 4, 4]
-            nn.ConvTranspose2d(in_dim, 512, 4, 1, 0, bias=False),
+            # --- Cone 1: Expansion ---
+            # [B, 384, 1, 1] -> [B, 1280, 4, 4] (7.86M params)
+            nn.ConvTranspose2d(in_dim, 1280, kernel_size=4, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(1280),
+            nn.ReLU(True),
+            
+            # Peak Expansion: [B, 1280, 4, 4] -> [B, 2048, 8, 8] (41.94M params)
+            nn.ConvTranspose2d(1280, 2048, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(2048),
+            nn.ReLU(True),
+            
+            # --- Cone 2: Contraction ---
+            # [B, 2048, 8, 8] -> [B, 1280, 16, 16] (41.94M params)
+            nn.ConvTranspose2d(2048, 1280, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(1280),
+            nn.ReLU(True),
+            
+            # [B, 1280, 16, 16] -> [B, 512, 32, 32] (10.49M params)
+            nn.ConvTranspose2d(1280, 512, kernel_size=4, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(512),
             nn.ReLU(True),
-
-            nn.ConvTranspose2d(512, 512, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(512),
-            nn.ReLU(True),
             
-            # [B, 512, 4, 4] -> [B, 256, 8, 8]
-            nn.ConvTranspose2d(512, 256, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.ReLU(True),
-            
-            # [B, 256, 8, 8] -> [B, 128, 16, 16]
-            nn.ConvTranspose2d(256, 128, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(128),
-            nn.ReLU(True),
-            
-            # [B, 128, 16, 16] -> [B, 3, 32, 32]
-            nn.ConvTranspose2d(128, 3, 4, 2, 1, bias=False),
-            nn.Tanh() # Scales output to [-1, 1]
+            # Final RGB Projection: [B, 512, 32, 32] -> [B, 3, 32, 32] (13.8K params)
+            nn.Conv2d(512, 3, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.Tanh()
         )
 
     def forward(self, z, labels):
