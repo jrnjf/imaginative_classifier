@@ -1,5 +1,11 @@
 import torch
 import torch.nn as nn
+
+def relative_factor(x1,x2):
+    y1 = x1/x2 - x2/x1
+    y2 = -y1
+    return torch.relu(1+y1), torch.relu(1+y2)
+
 class FocalBCEWithLogitsLoss(nn.Module):
     def __init__(self, gamma=2.0, alpha=0.25):
         super().__init__()
@@ -23,22 +29,7 @@ class UncertaintyWeightedLoss(nn.Module):
         super().__init__()
         self.use_dnn_meta = use_dnn_meta
         
-        if self.use_dnn_meta:
-            # Optional tiny DNN to dynamically output s1, s2, s3, s4 based on training state
-            # Using ReLU(inplace=False) to prevent PyTorch inplace modification version errors
-            self.meta_net = nn.Sequential(
-                nn.Linear(4, 16),
-                nn.ReLU(inplace=False),
-                nn.Linear(16, 16),
-                nn.ReLU(inplace=False),
-                nn.Linear(16, 4) # Outputs s1, s2, s3, s4
-            )
-        else:
-            # Independent learnable log-variances
-            self.s1 = nn.Parameter(torch.zeros(1))
-            self.s2 = nn.Parameter(torch.zeros(1))
-            self.s3 = nn.Parameter(torch.zeros(1))
-            self.s4 = nn.Parameter(torch.zeros(1))
+
             
         self.ce_loss = nn.CrossEntropyLoss()
         self.focal_G = FocalBCEWithLogitsLoss(gamma=2.0, alpha=0.25)
@@ -50,47 +41,42 @@ class UncertaintyWeightedLoss(nn.Module):
                 epoch_progress=0.0):
         
         # 1. Compute Base Component Losses
+        truth_logits = torch.cat([truth_logit_real, truth_logit_fake], dim=0)
+        truth_targets = torch.cat([torch.ones_like(truth_logit_real), torch.zeros_like(truth_logit_fake)], dim=0)
         l_class_real = self.ce_loss(class_logits_real, real_labels)
-        l_truth_real = self.focal_c(truth_logit_real, torch.ones_like(truth_logit_real))
-        l_truth_fake = self.focal_c(truth_logit_fake, torch.zeros_like(truth_logit_fake))
-        l_truth = l_truth_real + l_truth_fake
+        l_truth = self.focal_c(truth_logits, truth_targets)
+
         
         l_gen_class = self.ce_loss(class_logits_gen, fake_labels)
         l_gen_truth = self.focal_G(truth_logit_gen, torch.ones_like(truth_logit_gen))
-        
-        # 2. Get Uncertainty Weights (s1, s2, s3, s4)
-        if self.use_dnn_meta:
-            # Stack and add a batch dimension of size 1: shape becomes [1, 4]
-            loss_vector = torch.stack([
-                            l_class_real.detach(), 
-                            l_truth.detach(), 
-                            l_gen_class.detach(), 
-                            l_gen_truth.detach()
-                        ]).unsqueeze(0).detach()  # Shape becomes [1, 4]
-                        
-            s_vals = self.meta_net(loss_vector) # Shape [1, 4]
-            s1, s2, s3, s4 = s_vals[0, 0], s_vals[0, 1], s_vals[0, 2], s_vals[0, 3]
-        else:
-            s1, s2, s3, s4 = self.s1, self.s2, self.s3, self.s4
 
-        # Clamp to prevent numerical explosion/collapse [-3.0, 3.0]
-        """
-        s1 = torch.clamp(s1, min=-3.0, max=3.0)
-        s2 = torch.clamp(s2, min=-3.0, max=3.0)
-        s3 = torch.clamp(s3, min=-3.0, max=3.0)
-        s4 = torch.clamp(s4, min=-3.0, max=3.0)
-        """
-        # 3. Uncertainty-Weighted Multi-Task Formulation
-        weighted_loss_C = (torch.exp(-s1) * l_class_real + 0.5 * s1) + \
-                          (torch.exp(-s2) * l_truth + 0.5 * s2)
+        # 2. Get relative Weights (s1, s2, s3, s4)
+
+        fc_1, fc_2 = relative_factor(l_class_real, l_truth)
+        fg_1, fg_2 = relative_factor(l_gen_class, l_gen_truth)
+        fcg_1_class,fcg_2_class = relative_factor(l_class_real,l_gen_class)
+        fcg_1_truth,fcg_2_truth = relative_factor(l_truth,l_gen_truth)
+
+
+        #3. calculate weighted loss
+        weighted_loss_C = torch.exp(-fcg_2_class) * (torch.exp(-fc_2) * l_class_real + torch.exp(-fcg_2_truth)*l_gen_class)   + \
+                          torch.exp(-fcg_2_truth) * (torch.exp(-fc_1) * l_truth )
                           
-        weighted_loss_G = (torch.exp(-s3) * l_gen_class + 0.5 * s3) + \
-                          (torch.exp(-s4) * l_gen_truth + 0.5 * s4)
-                          
+        weighted_loss_G = torch.exp(-fcg_1_class) * (torch.exp(-fg_2) * l_gen_class ) + \
+                          torch.exp(-fcg_1_truth) * (torch.exp(-fg_1) * l_gen_truth )
         return weighted_loss_C, weighted_loss_G, {
             'l_class': l_class_real.item(),
             'l_truth': l_truth.item(),
             'l_gen_class': l_gen_class.item(),
             'l_gen_truth': l_gen_truth.item(),
-            's1': s1.item(), 's2': s2.item(), 's3': s3.item(), 's4': s4.item()
+            's1': [fc_1.item(), fc_2.item()],
+            's2': [fg_1.item(), fg_2.item()],
+            's3': [fcg_1_class.item(), fcg_2_class.item()],
+            's4': [fcg_1_truth.item(), fcg_2_truth.item()],
+            'classifier_class_factor': [torch.exp(-fcg_2_class) , torch.exp(-fc_2), torch.exp(-fcg_2_truth)] ,
+            'classifier_truth_factor': [torch.exp(-fcg_2_truth) , torch.exp(-fc_1)],
+            'generator_class_factor': [torch.exp(-fcg_1_class) *  torch.exp(-fg_2)],
+            'generator_truth_factor': [torch.exp(-fcg_1_truth),fg_1] 
         }
+
+        

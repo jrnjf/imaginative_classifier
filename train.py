@@ -36,7 +36,7 @@ def main():
 
     generator = ConditionalGenerator(latent_dim=latent_dim, num_classes=100).to(device)
     classifier = DualHeadResNet18(num_classes=100).to(device)
-    criterion_uncertainty = UncertaintyWeightedLoss(use_dnn_meta=True).to(device)
+    criterion_uncertainty = UncertaintyWeightedLoss(use_dnn_meta=False).to(device)
     
     # Momentum-free optimizers (SGD / AdamW configurations)
     if criterion_uncertainty.use_dnn_meta:
@@ -49,19 +49,14 @@ def main():
             {'params': criterion_uncertainty.meta_net.parameters(), 'lr': 0.0}
         ], lr=1.0, momentum=0.0, weight_decay=1e-4)
     else:
-        optimizer_C = optim.SGD([
-            {'params': classifier.parameters()},
-            {'params': [criterion_uncertainty.s1, criterion_uncertainty.s2], 'lr': 0.1}
-        ], lr=1.0, momentum=0.0, weight_decay=1e-3)
-        optimizer_G = optim.SGD([
-            {'params': generator.parameters()},
-            {'params': [criterion_uncertainty.s3, criterion_uncertainty.s4], 'lr': 0.1}
-        ], lr=1.0, momentum=0.0, weight_decay=1e-4)
+        optimizer_C = optim.SGD(classifier.parameters(), lr=1e-1, momentum=0.9, weight_decay=1e-9)
+        optimizer_G = optim.SGD(generator.parameters(), lr=1e-1, momentum=0.9, weight_decay=1e-9)
 
     steps_per_epoch = len(trainloader)
     period_steps = period_epochs * steps_per_epoch
-    scheduler_c = TriangularCosineLR(optimizer_C, period_steps=period_steps, total_steps=total_epochs*steps_per_epoch, lr_ratio=1000.0, cos_end_ratio=0.1)
-    scheduler_g = TriangularCosineLR(optimizer_G, period_steps=period_steps, total_steps=total_epochs*steps_per_epoch, lr_ratio=1000.0, cos_end_ratio=0.1) #, phase_steps=period_steps/2.0) 
+    if criterion_uncertainty.use_dnn_meta:
+        scheduler_c = TriangularCosineLR(optimizer_C, period_steps=period_steps, total_steps=total_epochs*steps_per_epoch, lr_ratio=1000.0, cos_end_ratio=0.1)
+        scheduler_g = TriangularCosineLR(optimizer_G, period_steps=period_steps, total_steps=total_epochs*steps_per_epoch, lr_ratio=1000.0, cos_end_ratio=0.1) #, phase_steps=period_steps/2.0) 
     
     ce_criterion = nn.CrossEntropyLoss()
 
@@ -105,19 +100,18 @@ def main():
             loss_G.backward()
             torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0) # <--- Add this
             optimizer_G.step()
-            scheduler_g.step()
+            scheduler_g.step() if criterion_uncertainty.use_dnn_meta else None
             optimizer_C.step()
-            scheduler_c.step()
+            scheduler_c.step() if criterion_uncertainty.use_dnn_meta else None
 
             
 
             # --- Per-Step Detailed Logging ---
-            if i % 100 == 0 or True:
+            if i % 100 == 0 :
                 print(f"Epoch [{epoch+1}/{total_epochs}], Step [{i}/{steps_per_epoch}]: "
                       f"Class Loss: {metrics['l_class']:.4f} | Truth Loss: {metrics['l_truth']:.4f} | "
                       f"Gen Class: {metrics['l_gen_class']:.4f} | Gen Truth: {metrics['l_gen_truth']:.4f} | "
-                      f"weights [s1: {metrics['s1']:.2f}, s2: {metrics['s2']:.2f}, s3: {metrics['s3']:.2f}, s4: {metrics['s4']:.2f}]")
-
+                      f"weights [fc: {metrics['s1'][0]:.2f},{metrics['s1'][1]:.2f} fg: {metrics['s2'][0]:.2f},{metrics['s2'][1]:.2f}, fcg class: {metrics['s3'][0]:.2f},{metrics['s3'][1]:.2f}, fcg truth: {metrics['s4'][0]:.2f},{metrics['s4'][1]:.2f}] | ")
         # ---------------------------------------------------------
         # Validation Loop (Standard Cross-Entropy & Accuracy)
         # ---------------------------------------------------------
